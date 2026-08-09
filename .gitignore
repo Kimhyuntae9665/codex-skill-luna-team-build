@@ -1,0 +1,12 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local run noise
+*.log
+*.tmp

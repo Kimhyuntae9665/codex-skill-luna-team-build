@@ -1,0 +1,5 @@
+scenario,workers,workload,wall_seconds,summed_worker_seconds,parallelism_ratio,utilization,balance_ratio,start_skew_seconds,source_artifact_id,source_sha256,source_bytes
+one-worker-token-smoke,1,token smoke,8.513,8.294,0.974,0.974,1.000,0.000,luna-current-smoke-27ab345726c645629a6b261be428c319/run-summary.json,2306819451a4fbebb0e1b583625fcb3488afedd1f8d33ac89a8f03f8329c318f,4078
+seven-worker-equal-token-smoke,7,equal token smoke,18.407,87.661,4.762,0.680,0.542,0.254,luna-final-seven-smoke-6b6d60cb1e484ef88e83d58af1a89760/run-summary.json,f54c156bd96e35f6bccd315c8b7d3f0d5d7dc7e3b8555dfb6fda2e9aa812729e,11300
+seven-worker-varied-council-audit,7,varied Council audit,404.988,1697.198,4.191,0.599,0.132,0.223,luna-team-seven-forward-20260809-201502/run-summary.json,d689cd4f147b83cd1bc5109ca2eae6f3aaed940db11dc9c16faf21df014c621e,5955
+one-worker-architecture-review,1,architecture review,180.643,180.561,1.000,1.000,1.000,0.000,luna-skill-review-93731a7458144b6bbb079f0bfe1e6677/run-summary.json,508e8c2c1a891f45e21349afa207143d73bc97da023a47a0bdb30c86094f5e7b,4713

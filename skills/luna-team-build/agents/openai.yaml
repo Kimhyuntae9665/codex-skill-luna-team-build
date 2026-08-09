@@ -1,0 +1,7 @@
+interface:
+  display_name: "Luna Team Build"
+  short_description: "Council-planned Sol-only or zero to seven Luna workers"
+  default_prompt: "Use $luna-team-build to apply $council's five roles, compare zero to seven choices (Sol-only k=0 or one positive ready wave), choose the lowest-time plan, then integrate and verify."
+
+policy:
+  allow_implicit_invocation: false
