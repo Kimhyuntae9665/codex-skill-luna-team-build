@@ -5,7 +5,8 @@ param(
     [string]$OutputDirectory,
     [switch]$Detached,
     [switch]$ValidateOnly,
-    [string]$RunId
+    [string]$RunId,
+    [string]$CodexExecutable = "codex"
 )
 
 Set-StrictMode -Version Latest
@@ -23,6 +24,12 @@ $workerNestedDelegation = "disabled"
 $maxWorkers = 7
 $workerConcurrencyScope = "one-live-run-per-windows-session"
 $workerMutexName = "Local\Codex.LunaTeamBuild.Run"
+$schedulerMode = $null
+$concurrencyLimit = $null
+$isSchemaV2 = $false
+$taskCount = 0
+$initialReadyCount = 0
+$peakActiveWorkers = 0
 
 function Get-UtcTimestamp {
     [DateTimeOffset]::UtcNow.ToString("O", [System.Globalization.CultureInfo]::InvariantCulture)
@@ -233,34 +240,68 @@ $planInput = $null
 $schemaVersion = $null
 if ($null -ne $parsedManifest -and
     $parsedManifest.PSObject.Properties.Name -contains "workers") {
-    $manifestFormat = "planning-council-v1"
     $schemaVersion = Get-OptionalProperty -Object $parsedManifest -Name "schema_version"
+    try {
+        $schemaVersion = [int]$schemaVersion
+    } catch {
+        throw "The Planning Council manifest requires schema_version 1 or 2."
+    }
+    if ($schemaVersion -notin @(1, 2)) {
+        throw "The Planning Council manifest requires schema_version 1 or 2."
+    }
+    $manifestFormat = "planning-council-v$schemaVersion"
+    $isSchemaV2 = $schemaVersion -eq 2
     $planInput = Get-OptionalProperty -Object $parsedManifest -Name "plan"
     $tasks = @(Get-OptionalProperty -Object $parsedManifest -Name "workers")
 } else {
     $tasks = @($parsedManifest)
 }
 
-if ($manifestFormat -eq "planning-council-v1") {
+if ($manifestFormat -like "planning-council-v*") {
     if ($tasks.Count -lt 0 -or $tasks.Count -gt $maxWorkers) {
         throw "The structured manifest must contain between zero and $maxWorkers workers."
     }
 } elseif ($tasks.Count -lt 1 -or $tasks.Count -gt $maxWorkers) {
     throw "The legacy manifest must contain between one and $maxWorkers workers."
 }
-if ($tasks.Count -gt 3 -and $manifestFormat -ne "planning-council-v1") {
+if ($tasks.Count -gt 3 -and $manifestFormat -notlike "planning-council-v*") {
     throw "Four to seven workers require the structured Planning Council manifest."
 }
 
 $planWarnings = [System.Collections.Generic.List[string]]::new()
 $normalizedPlan = $null
 $normalizedRootOwnedPaths = @()
-if ($manifestFormat -eq "planning-council-v1") {
-    if ([int]$schemaVersion -ne 1) {
-        throw "The Planning Council manifest requires schema_version 1."
-    }
+if ($manifestFormat -like "planning-council-v*") {
     if ($null -eq $planInput) {
         throw "The Planning Council manifest is missing its plan object."
+    }
+
+    if ($isSchemaV2) {
+        $schedulerMode = [string](
+            Get-OptionalProperty -Object $planInput -Name "scheduler_mode" -Default ""
+        )
+        if ($schedulerMode -notin @("rolling-dag-v1", "barrier-dag-v1")) {
+            throw "schema_version 2 requires plan.scheduler_mode to be rolling-dag-v1 or barrier-dag-v1."
+        }
+        if ($tasks.Count -lt 1) {
+            throw "schema_version 2 requires at least one selected task for concurrency_limit."
+        }
+        try {
+            $concurrencyRaw = Get-OptionalProperty -Object $planInput -Name "concurrency_limit"
+            $concurrencyLimit = [int](
+                $concurrencyRaw
+            )
+            if ($null -ne $concurrencyRaw -and
+                [double]$concurrencyRaw -ne [double]$concurrencyLimit) {
+                throw "not an integer"
+            }
+        } catch {
+            throw "schema_version 2 requires an integer plan.concurrency_limit."
+        }
+        $maximumV2Concurrency = [Math]::Min($tasks.Count, $maxWorkers)
+        if ($concurrencyLimit -lt 1 -or $concurrencyLimit -gt $maximumV2Concurrency) {
+            throw "plan.concurrency_limit must be between 1 and $maximumV2Concurrency."
+        }
     }
 
     $councilUsedRaw = Get-OptionalProperty -Object $planInput -Name "council_used"
@@ -340,7 +381,7 @@ if ($manifestFormat -eq "planning-council-v1") {
     if ($selectedWorkerCount -ne $tasks.Count) {
         throw "selected_worker_count must equal the manifest worker count."
     }
-    if ($selectedWorkerCount -gt $readyTrackCount) {
+    if (-not $isSchemaV2 -and $selectedWorkerCount -gt $readyTrackCount) {
         throw "selected_worker_count cannot exceed ready_track_count."
     }
     if ($planningSecondsEstimate -lt 0) {
@@ -350,8 +391,13 @@ if ($manifestFormat -eq "planning-council-v1") {
     $candidateScheduleInputs = @(
         Get-OptionalProperty -Object $planInput -Name "candidate_schedules"
     )
-    if ($candidateScheduleInputs.Count -ne ($readyTrackCount + 1)) {
-        throw "candidate_schedules must cover every worker count from zero through ready_track_count."
+    $candidateCountLimit = if ($isSchemaV2) {
+        $selectedWorkerCount
+    } else {
+        $readyTrackCount
+    }
+    if ($candidateScheduleInputs.Count -ne ($candidateCountLimit + 1)) {
+        throw "candidate_schedules must cover every worker count from zero through the selected candidate limit."
     }
     $seenCandidateCounts = [System.Collections.Generic.HashSet[int]]::new()
     $normalizedCandidateSchedules = @(
@@ -383,8 +429,8 @@ if ($manifestFormat -eq "planning-council-v1") {
             } catch {
                 throw "A candidate schedule contains invalid numeric fields."
             }
-            if ($candidateWorkerCount -lt 0 -or $candidateWorkerCount -gt $readyTrackCount) {
-                throw "Candidate worker_count is outside the ready-track range: $candidateWorkerCount"
+            if ($candidateWorkerCount -lt 0 -or $candidateWorkerCount -gt $candidateCountLimit) {
+                throw "Candidate worker_count is outside the selected candidate range: $candidateWorkerCount"
             }
             if (-not $seenCandidateCounts.Add($candidateWorkerCount)) {
                 throw "Duplicate candidate worker_count: $candidateWorkerCount"
@@ -417,7 +463,7 @@ if ($manifestFormat -eq "planning-council-v1") {
             }
         }
     )
-    foreach ($expectedCandidateCount in 0..$readyTrackCount) {
+    foreach ($expectedCandidateCount in 0..$candidateCountLimit) {
         if (-not $seenCandidateCounts.Contains($expectedCandidateCount)) {
             throw "Missing candidate worker_count: $expectedCandidateCount"
         }
@@ -465,6 +511,10 @@ if ($manifestFormat -eq "planning-council-v1") {
         root_tasks_during_workers = [string[]]$rootTasksDuringWorkers
         root_owned_paths = [string[]]$normalizedRootOwnedPaths
     }
+    if ($isSchemaV2) {
+        $normalizedPlan["scheduler_mode"] = $schedulerMode
+        $normalizedPlan["concurrency_limit"] = $concurrencyLimit
+    }
 } else {
     [void]$planWarnings.Add(
         "Legacy manifest: Planning Council metadata and deterministic ownership lint are incomplete."
@@ -498,7 +548,7 @@ $validatedTasks = @(
     if ($requestedSandboxMode -notin @("read-only", "workspace-write", "danger-full-access")) {
         throw "Worker '$name' has an invalid sandbox_mode: $requestedSandboxMode"
     }
-    if ($manifestFormat -eq "planning-council-v1" -and
+    if ($manifestFormat -like "planning-council-v*" -and
         $requestedSandboxMode -ne $workerSandboxMode) {
         throw "Structured worker '$name' must explicitly request sandbox_mode=$workerSandboxMode."
     }
@@ -550,10 +600,10 @@ $validatedTasks = @(
         }
     }
 
-    if ($dependsOn.Count -gt 0) {
+    if (-not $isSchemaV2 -and $dependsOn.Count -gt 0) {
         throw "Worker '$name' has unresolved same-wave dependencies: $($dependsOn -join ', ')"
     }
-    if ($manifestFormat -eq "planning-council-v1") {
+    if ($manifestFormat -like "planning-council-v*") {
         if ($null -eq $estimatedSeconds) {
             throw "Worker '$name' is missing estimated_seconds."
         }
@@ -591,6 +641,118 @@ $validatedTasks = @(
     }
 )
 
+$taskCount = $validatedTasks.Count
+$taskByName = @{}
+$dependentsByName = @{}
+$criticalPathByName = @{}
+$criticalPathTaskNames = @()
+$criticalPathSeconds = 0.0
+$topologicalNames = [System.Collections.Generic.List[string]]::new()
+$initialReadyNames = [System.Collections.Generic.List[string]]::new()
+foreach ($task in $validatedTasks) {
+    $taskByName[$task.name] = $task
+    $dependentsByName[$task.name] = @()
+}
+
+if ($isSchemaV2) {
+    foreach ($task in $validatedTasks) {
+        $seenDependencies = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+        foreach ($dependencyName in @($task.depends_on)) {
+            if (-not $seenDependencies.Add($dependencyName)) {
+                throw "Worker '$($task.name)' has duplicate dependency '$dependencyName'."
+            }
+            if ([string]::Equals($task.name, $dependencyName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Worker '$($task.name)' cannot depend on itself."
+            }
+            if (-not $taskByName.ContainsKey($dependencyName)) {
+                throw "Worker '$($task.name)' has missing dependency '$dependencyName'."
+            }
+            $dependencyTask = $taskByName[$dependencyName]
+            $dependentsByName[$dependencyTask.name] = @(
+                $dependentsByName[$dependencyTask.name] + $task.name
+            )
+        }
+    }
+
+    $topologicalIndegree = @{}
+    $topologicalReady = [System.Collections.Generic.List[string]]::new()
+    foreach ($task in $validatedTasks) {
+        $topologicalIndegree[$task.name] = @($task.depends_on).Count
+        if (@($task.depends_on).Count -eq 0) {
+            [void]$topologicalReady.Add($task.name)
+        }
+    }
+    while ($topologicalReady.Count -gt 0) {
+        $nextName = @($topologicalReady | Sort-Object)[0]
+        [void]$topologicalReady.Remove($nextName)
+        [void]$topologicalNames.Add($nextName)
+        foreach ($dependentName in @($dependentsByName[$nextName] | Sort-Object)) {
+            $topologicalIndegree[$dependentName] = [int]$topologicalIndegree[$dependentName] - 1
+            if ([int]$topologicalIndegree[$dependentName] -eq 0) {
+                [void]$topologicalReady.Add($dependentName)
+            }
+        }
+    }
+    if ($topologicalNames.Count -ne $validatedTasks.Count) {
+        throw "The v2 dependency graph contains a cycle."
+    }
+
+    for ($topologicalIndex = $topologicalNames.Count - 1; $topologicalIndex -ge 0; $topologicalIndex--) {
+        $taskName = $topologicalNames[$topologicalIndex]
+        $childCriticalPath = 0.0
+        foreach ($dependentName in @($dependentsByName[$taskName])) {
+            if ([double]$criticalPathByName[$dependentName] -gt $childCriticalPath) {
+                $childCriticalPath = [double]$criticalPathByName[$dependentName]
+            }
+        }
+        $criticalPathByName[$taskName] = [Math]::Round(
+            [double]$taskByName[$taskName].estimated_seconds + $childCriticalPath,
+            3
+        )
+    }
+    foreach ($task in $validatedTasks) {
+        if (@($task.depends_on).Count -eq 0) {
+            [void]$initialReadyNames.Add($task.name)
+        }
+    }
+    $initialReadyCount = $initialReadyNames.Count
+    if ($readyTrackCount -ne $initialReadyCount) {
+        throw "schema_version 2 ready_track_count must equal the computed initial-ready task count ($initialReadyCount)."
+    }
+
+    $criticalPathSeconds = [double](
+        $criticalPathByName.Values | Measure-Object -Maximum
+    ).Maximum
+    $criticalPathCursor = @(
+        $initialReadyNames |
+            Sort-Object `
+                -Property `
+                    @{ Expression = { [double]$criticalPathByName[[string]$_] }; Descending = $true },
+                    @{ Expression = { [double]$taskByName[[string]$_].estimated_seconds }; Descending = $true },
+                    @{ Expression = { [string]$_ }; Ascending = $true }
+    )[0]
+    $criticalPathTasks = [System.Collections.Generic.List[string]]::new()
+    while (-not [string]::IsNullOrWhiteSpace($criticalPathCursor)) {
+        [void]$criticalPathTasks.Add($criticalPathCursor)
+        $nextCriticalTasks = @(
+            $dependentsByName[$criticalPathCursor] |
+                Sort-Object `
+                    -Property `
+                        @{ Expression = { [double]$criticalPathByName[[string]$_] }; Descending = $true },
+                        @{ Expression = { [double]$taskByName[[string]$_].estimated_seconds }; Descending = $true },
+                        @{ Expression = { [string]$_ }; Ascending = $true }
+        )
+        $criticalPathCursor = if ($nextCriticalTasks.Count -gt 0) {
+            [string]$nextCriticalTasks[0]
+        } else {
+            $null
+        }
+    }
+    $criticalPathTaskNames = [string[]]$criticalPathTasks
+}
+
 for ($firstIndex = 0; $firstIndex -lt $validatedTasks.Count; $firstIndex++) {
     for ($secondIndex = $firstIndex + 1; $secondIndex -lt $validatedTasks.Count; $secondIndex++) {
         $firstTask = $validatedTasks[$firstIndex]
@@ -620,6 +782,129 @@ $estimatedDurations = @(
         Where-Object { $null -ne $_.estimated_seconds } |
         ForEach-Object { [double]$_.estimated_seconds }
 )
+
+function Get-DeterministicReadyOrder {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IEnumerable]$Names
+    )
+
+    @(
+        $Names |
+            Sort-Object `
+                -Property `
+                @{ Expression = { [double]$criticalPathByName[[string]$_] }; Descending = $true },
+                @{ Expression = { [double]$taskByName[[string]$_].estimated_seconds }; Descending = $true },
+                @{ Expression = { [string]$_ }; Ascending = $true }
+    )
+}
+
+function Invoke-DagScheduleSimulation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("rolling-dag-v1", "barrier-dag-v1")]
+        [string]$Mode,
+        [Parameter(Mandatory = $true)]
+        [int]$Limit
+    )
+
+    $simulationState = @{}
+    $simulationReady = [System.Collections.Generic.List[string]]::new()
+    $simulationActive = @{}
+    $simulationFinish = @{}
+    foreach ($task in $validatedTasks) {
+        $simulationState[$task.name] = "pending"
+        if (@($task.depends_on).Count -eq 0) {
+            [void]$simulationReady.Add($task.name)
+        }
+    }
+
+    $simulationTime = 0.0
+    $simulationPeak = 0
+    $simulationCompleted = 0
+    while ($simulationCompleted -lt $validatedTasks.Count) {
+        if ($Mode -eq "barrier-dag-v1") {
+            if ($simulationActive.Count -eq 0) {
+                $batch = @(Get-DeterministicReadyOrder -Names $simulationReady |
+                    Select-Object -First $Limit)
+                if ($batch.Count -eq 0) {
+                    throw "The v2 DAG scheduler simulation could not find ready work."
+                }
+                foreach ($taskName in $batch) {
+                    [void]$simulationReady.Remove($taskName)
+                    $simulationState[$taskName] = "running"
+                    $simulationActive[$taskName] = $true
+                    $simulationFinish[$taskName] = $simulationTime +
+                        [double]$taskByName[$taskName].estimated_seconds
+                }
+                if ($simulationActive.Count -gt $simulationPeak) {
+                    $simulationPeak = $simulationActive.Count
+                }
+            }
+            $nextSimulationTime = [double](
+                ($simulationActive.Keys |
+                    ForEach-Object { [double]$simulationFinish[$_] } |
+                    Measure-Object -Maximum).Maximum
+            )
+        } else {
+            while ($simulationActive.Count -lt $Limit -and $simulationReady.Count -gt 0) {
+                $nextTaskName = @(Get-DeterministicReadyOrder -Names $simulationReady)[0]
+                [void]$simulationReady.Remove($nextTaskName)
+                $simulationState[$nextTaskName] = "running"
+                $simulationActive[$nextTaskName] = $true
+                $simulationFinish[$nextTaskName] = $simulationTime +
+                    [double]$taskByName[$nextTaskName].estimated_seconds
+            }
+            if ($simulationActive.Count -gt $simulationPeak) {
+                $simulationPeak = $simulationActive.Count
+            }
+            if ($simulationActive.Count -eq 0) {
+                throw "The v2 DAG scheduler simulation could not find ready work."
+            }
+            $nextSimulationTime = [double](
+                ($simulationActive.Keys |
+                    ForEach-Object { [double]$simulationFinish[$_] } |
+                    Measure-Object -Minimum).Minimum
+            )
+        }
+
+        $simulationTime = $nextSimulationTime
+        $completedNow = @(
+            $simulationActive.Keys |
+                Where-Object { [double]$simulationFinish[$_] -le $simulationTime } |
+                Sort-Object
+        )
+        foreach ($completedTaskName in $completedNow) {
+            $simulationState[$completedTaskName] = "completed"
+            [void]$simulationActive.Remove($completedTaskName)
+            $simulationCompleted++
+        }
+        foreach ($completedTaskName in $completedNow) {
+            foreach ($dependentName in @($dependentsByName[$completedTaskName])) {
+                if ($simulationState[$dependentName] -ne "pending") {
+                    continue
+                }
+                $allDependenciesCompleted = $true
+                foreach ($dependencyName in @($taskByName[$dependentName].depends_on)) {
+                    if ($simulationState[$dependencyName] -ne "completed") {
+                        $allDependenciesCompleted = $false
+                        break
+                    }
+                }
+                if ($allDependenciesCompleted) {
+                    $simulationState[$dependentName] = "ready"
+                    [void]$simulationReady.Add($dependentName)
+                }
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        worker_wall_seconds = [Math]::Round($simulationTime, 3)
+        peak_active_workers = $simulationPeak
+    }
+}
+
 $predictedSchedule = $null
 if ($estimatedDurations.Count -eq $validatedTasks.Count) {
     if ($validatedTasks.Count -eq 0) {
@@ -679,7 +964,47 @@ if ($estimatedDurations.Count -eq $validatedTasks.Count) {
             ) -gt 0.001) {
             throw "The selected candidate's predicted_worker_wall_seconds must equal the slowest selected worker estimate ($estimatedMaximum)."
         }
-        $predictedSchedule.selected_predicted_total_seconds =
+        $predictedSchedule["selected_predicted_total_seconds"] =
+            [double]$selectedCandidateSchedule.predicted_total_seconds
+    } elseif ($isSchemaV2) {
+        $dagSimulation = Invoke-DagScheduleSimulation `
+            -Mode $schedulerMode `
+            -Limit $concurrencyLimit
+        $predictedCapacityUtilization = if (
+            [double]$dagSimulation.worker_wall_seconds -gt 0 -and
+            $concurrencyLimit -gt 0
+        ) {
+            [Math]::Round(
+                $estimatedSum /
+                    ($concurrencyLimit * [double]$dagSimulation.worker_wall_seconds),
+                3
+            )
+        } else {
+            0.0
+        }
+        $selectedCandidateSchedule = @(
+            $normalizedCandidateSchedules |
+                Where-Object { [int]$_.worker_count -eq $validatedTasks.Count }
+        )[0]
+        if ([Math]::Abs(
+                [double]$selectedCandidateSchedule.predicted_worker_wall_seconds -
+                [double]$dagSimulation.worker_wall_seconds
+            ) -gt 0.001) {
+            throw "The selected candidate's predicted_worker_wall_seconds must equal the v2 deterministic DAG worker wall time ($($dagSimulation.worker_wall_seconds))."
+        }
+        $predictedSchedule["scheduler_mode"] = $schedulerMode
+        $predictedSchedule["concurrency_limit"] = $concurrencyLimit
+        $predictedSchedule["task_count"] = $validatedTasks.Count
+        $predictedSchedule["initial_ready_count"] = $initialReadyCount
+        $predictedSchedule["peak_active_workers"] = $dagSimulation.peak_active_workers
+        $predictedSchedule["utilization_capacity_denominator"] = $concurrencyLimit
+        $predictedSchedule["predicted_capacity_utilization"] =
+            $predictedCapacityUtilization
+        $predictedSchedule["critical_path"] = [string[]]$criticalPathTaskNames
+        $predictedSchedule["predicted_worker_wall_seconds"] =
+            [double]$dagSimulation.worker_wall_seconds
+        $predictedSchedule["critical_path_seconds"] = $criticalPathSeconds
+        $predictedSchedule["selected_predicted_total_seconds"] =
             [double]$selectedCandidateSchedule.predicted_total_seconds
     }
     if ($validatedTasks.Count -gt 0 -and $predictedMaxMedianRatio -gt 1.5) {
@@ -699,7 +1024,7 @@ if ($estimatedDurations.Count -eq $validatedTasks.Count) {
 # manifest truthful instead of retaining the caller's narrower request.
 $normalizedTasks = @(
     $validatedTasks | ForEach-Object {
-        [ordered]@{
+        $normalizedTask = [ordered]@{
             name = $_.name
             prompt = $_.prompt
             working_directory = $_.working_directory
@@ -717,6 +1042,25 @@ $normalizedTasks = @(
             approval_policy = $_.approval_policy
             nested_delegation = $workerNestedDelegation
         }
+        if ($isSchemaV2) {
+            $normalizedTask["scheduler_mode"] = $schedulerMode
+            $normalizedTask["concurrency_limit"] = $concurrencyLimit
+            $normalizedTask["task_count"] = $validatedTasks.Count
+            $normalizedTask["state"] = if (@($_.depends_on).Count -eq 0) { "ready" } else { "pending" }
+            $normalizedTask["ready_at"] = $null
+            $normalizedTask["started_at"] = $null
+            $normalizedTask["completed_at"] = $null
+            $normalizedTask["queue_wait_seconds"] = $null
+            $normalizedTask["critical_path_seconds"] = [double]$criticalPathByName[$_.name]
+            $normalizedTask["blocked_by"] = [string[]]$_.depends_on
+            $normalizedDependencyStates = [ordered]@{}
+            foreach ($dependencyName in @($_.depends_on)) {
+                $normalizedDependencyStates[$dependencyName] = "pending"
+            }
+            $normalizedTask["dependency_states"] = $normalizedDependencyStates
+            $normalizedTask["skip_reason"] = $null
+        }
+        $normalizedTask
     }
 )
 
@@ -763,8 +1107,36 @@ $workerRecords = @(
             duration_seconds = $null
             exit_code = $null
             error = $null
+            scheduler_mode = $null
+            concurrency_limit = $null
+            task_count = $null
+            ready_at = $null
+            queue_wait_seconds = $null
+            critical_path_seconds = $null
+            blocked_by = [string[]]@()
+            dependency_states = [ordered]@{}
+            skip_reason = $null
             last_message_path = Join-Path $OutputDirectory "$($task.name)-last-message.txt"
             log_path = Join-Path $OutputDirectory "$($task.name)-events.log"
+        }
+        if ($isSchemaV2) {
+            $record.scheduler_mode = $schedulerMode
+            $record.concurrency_limit = $concurrencyLimit
+            $record.task_count = $validatedTasks.Count
+            $record.ready_at = if (@($task.depends_on).Count -eq 0) {
+                $runStartedAtText
+            } else {
+                $null
+            }
+            $record.queue_wait_seconds = $null
+            $record.critical_path_seconds = [double]$criticalPathByName[$task.name]
+            $record.blocked_by = [string[]]$task.depends_on
+            $record.dependency_states = [ordered]@{}
+            foreach ($dependencyName in @($task.depends_on)) {
+                $record.dependency_states[$dependencyName] = "pending"
+            }
+            $record.skip_reason = $null
+            $record.state = if (@($task.depends_on).Count -eq 0) { "ready" } else { "pending" }
         }
         $workerRecordByName[$task.name] = $record
         $record
@@ -777,7 +1149,7 @@ function Get-StatusWorker {
         [pscustomobject]$Record
     )
 
-    [ordered]@{
+    $statusWorker = [ordered]@{
         name = $Record.name
         working_directory = $Record.working_directory
         review_only = $Record.review_only
@@ -802,6 +1174,18 @@ function Get-StatusWorker {
         last_message_path = $Record.last_message_path
         log_path = $Record.log_path
     }
+    if ($isSchemaV2) {
+        $statusWorker["scheduler_mode"] = $Record.scheduler_mode
+        $statusWorker["concurrency_limit"] = $Record.concurrency_limit
+        $statusWorker["task_count"] = $Record.task_count
+        $statusWorker["ready_at"] = $Record.ready_at
+        $statusWorker["queue_wait_seconds"] = $Record.queue_wait_seconds
+        $statusWorker["critical_path_seconds"] = $Record.critical_path_seconds
+        $statusWorker["blocked_by"] = [string[]]$Record.blocked_by
+        $statusWorker["dependency_states"] = $Record.dependency_states
+        $statusWorker["skip_reason"] = $Record.skip_reason
+    }
+    $statusWorker
 }
 
 function Write-RunStatus {
@@ -812,6 +1196,14 @@ function Write-RunStatus {
     )
 
     $statusWorkers = @($workerRecords | ForEach-Object { Get-StatusWorker -Record $_ })
+    $statusStateCounts = [ordered]@{
+        pending = @($workerRecords | Where-Object { $_.state -eq "pending" }).Count
+        ready = @($workerRecords | Where-Object { $_.state -eq "ready" }).Count
+        running = @($workerRecords | Where-Object { $_.state -eq "running" }).Count
+        completed = @($workerRecords | Where-Object { $_.state -eq "completed" }).Count
+        failed = @($workerRecords | Where-Object { $_.state -eq "failed" }).Count
+        skipped = @($workerRecords | Where-Object { $_.state -eq "skipped" }).Count
+    }
     $statusDocument = [ordered]@{
         run_id = $RunId
         status = $RunState
@@ -837,6 +1229,20 @@ function Write-RunStatus {
         summary_path = $runSummaryPath
         workers = $statusWorkers
     }
+    if ($isSchemaV2) {
+        $statusDocument["scheduler_mode"] = $schedulerMode
+        $statusDocument["concurrency_limit"] = $concurrencyLimit
+        $statusDocument["task_count"] = $taskCount
+        $statusDocument["initial_ready_count"] = $initialReadyCount
+        $statusDocument["critical_path"] = [string[]]$criticalPathTaskNames
+        $statusDocument["critical_path_seconds"] = $criticalPathSeconds
+        $statusDocument["peak_active_workers"] = $peakActiveWorkers
+        $statusDocument["active_workers"] = $statusStateCounts.running
+        $statusDocument["state_counts"] = $statusStateCounts
+        $statusDocument["completed_count"] = $statusStateCounts.completed
+        $statusDocument["failed_count"] = $statusStateCounts.failed
+        $statusDocument["skipped_count"] = $statusStateCounts.skipped
+    }
     Write-AtomicJson -Path $runStatusPath -Value $statusDocument -Depth 10
 }
 
@@ -845,7 +1251,8 @@ function New-WorkerResult {
         [Parameter(Mandatory = $true)]
         [pscustomobject]$Record,
         [Parameter(Mandatory = $true)]
-        [int]$ExitCode,
+        [AllowNull()]
+        [object]$ExitCode,
         [AllowEmptyString()]
         [string]$LastMessage,
         [AllowEmptyString()]
@@ -876,6 +1283,20 @@ function New-WorkerResult {
         completed_at = $Record.completed_at
         duration_seconds = $Record.duration_seconds
     }
+    if ($isSchemaV2) {
+        $result["scheduler_mode"] = $Record.scheduler_mode
+        $result["concurrency_limit"] = $Record.concurrency_limit
+        $result["task_count"] = $Record.task_count
+        $result["initial_ready_count"] = $initialReadyCount
+        $result["peak_active_workers"] = $peakActiveWorkers
+        $result["state"] = $Record.state
+        $result["ready_at"] = $Record.ready_at
+        $result["queue_wait_seconds"] = $Record.queue_wait_seconds
+        $result["critical_path_seconds"] = $Record.critical_path_seconds
+        $result["blocked_by"] = [string[]]$Record.blocked_by
+        $result["dependency_states"] = $Record.dependency_states
+        $result["skip_reason"] = $Record.skip_reason
+    }
     if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) {
         $result.error = $ErrorMessage
     }
@@ -894,6 +1315,23 @@ if ($manifestFormat -eq "planning-council-v1") {
     $normalizedManifestJson = ConvertTo-Json `
         -InputObject $normalizedManifestDocument `
         -Depth 15
+} elseif ($isSchemaV2) {
+    $normalizedManifestDocument = [ordered]@{
+        schema_version = 2
+        scheduler_mode = $schedulerMode
+        concurrency_limit = $concurrencyLimit
+        task_count = $taskCount
+        initial_ready_count = $initialReadyCount
+        critical_path = [string[]]$criticalPathTaskNames
+        critical_path_seconds = $criticalPathSeconds
+        peak_active_workers = $peakActiveWorkers
+        plan = $normalizedPlan
+        plan_warnings = [string[]]$planWarnings
+        workers = [object[]]$normalizedTasks
+    }
+    $normalizedManifestJson = ConvertTo-Json `
+        -InputObject $normalizedManifestDocument `
+        -Depth 15
 } else {
     $normalizedManifestJson = ConvertTo-Json `
         -InputObject ([object[]]$normalizedTasks) `
@@ -903,7 +1341,7 @@ Write-AtomicText -Path $runManifestPath -Content ([string]$normalizedManifestJso
 
 if ($ValidateOnly) {
     Write-RunStatus -RunState "validated" -ProcessId $null
-    [ordered]@{
+    $validationOutput = [ordered]@{
         valid = $true
         run_id = $RunId
         worker_count = $validatedTasks.Count
@@ -916,7 +1354,17 @@ if ($ValidateOnly) {
         nested_delegation = $workerNestedDelegation
         manifest_path = $runManifestPath
         status_path = $runStatusPath
-    } | ConvertTo-Json -Depth 10
+    }
+    if ($isSchemaV2) {
+        $validationOutput["scheduler_mode"] = $schedulerMode
+        $validationOutput["concurrency_limit"] = $concurrencyLimit
+        $validationOutput["task_count"] = $taskCount
+        $validationOutput["initial_ready_count"] = $initialReadyCount
+        $validationOutput["critical_path"] = [string[]]$criticalPathTaskNames
+        $validationOutput["critical_path_seconds"] = $criticalPathSeconds
+        $validationOutput["peak_active_workers"] = $peakActiveWorkers
+    }
+    $validationOutput | ConvertTo-Json -Depth 10
     return
 }
 
@@ -962,6 +1410,7 @@ if ($Detached) {
     $stdoutPathBase64 = & $encodeUtf8 $runStdoutPath
     $stderrPathBase64 = & $encodeUtf8 $runStderrPath
     $runIdBase64 = & $encodeUtf8 $RunId
+    $codexExecutableBase64 = & $encodeUtf8 $CodexExecutable
     $childBootstrap = @"
 `$decode = {
     param([string]`$Value)
@@ -973,8 +1422,9 @@ if ($Detached) {
 `$stdoutPath = & `$decode '$stdoutPathBase64'
 `$stderrPath = & `$decode '$stderrPathBase64'
 `$runId = & `$decode '$runIdBase64'
+`$codexExecutable = & `$decode '$codexExecutableBase64'
 try {
-    & `$scriptPath -ManifestPath `$manifestPath -OutputDirectory `$outputDirectory -RunId `$runId 1> `$stdoutPath 2> `$stderrPath
+    & `$scriptPath -ManifestPath `$manifestPath -OutputDirectory `$outputDirectory -RunId `$runId -CodexExecutable `$codexExecutable 1> `$stdoutPath 2> `$stderrPath
     if (`$null -ne `$LASTEXITCODE) {
         exit [int]`$LASTEXITCODE
     }
@@ -1048,6 +1498,15 @@ try {
             stderr_path = $runStderrPath
         }
     }
+    if ($isSchemaV2) {
+        $detachedResponse["scheduler_mode"] = $schedulerMode
+        $detachedResponse["concurrency_limit"] = $concurrencyLimit
+        $detachedResponse["task_count"] = $taskCount
+        $detachedResponse["initial_ready_count"] = $initialReadyCount
+        $detachedResponse["critical_path"] = [string[]]$criticalPathTaskNames
+        $detachedResponse["critical_path_seconds"] = $criticalPathSeconds
+        $detachedResponse["peak_active_workers"] = $peakActiveWorkers
+    }
     $detachedResponse | ConvertTo-Json -Depth 5
     return
 }
@@ -1058,7 +1517,8 @@ $workerScript = {
         [string]$TaskPrompt,
         [string]$WorkingDirectory,
         [string]$RunOutputDirectory,
-        [string]$AssignmentContract
+        [string]$AssignmentContract,
+        [string]$CodexExecutable
     )
 
     $ErrorActionPreference = "Stop"
@@ -1083,6 +1543,18 @@ Task name: $TaskName
 Structured assignment contract:
 $AssignmentContract
 
+Dependency handoff (no raw predecessor output injection):
+Predecessor task names: $([string]::Join(', ', @(
+    try {
+        $contractObject = $AssignmentContract | ConvertFrom-Json
+        @($contractObject.predecessor_task_names)
+    } catch {
+        @()
+    }
+)))
+Read only frozen artifacts/contracts declared by those predecessor tasks; do not expect predecessor output to be injected into this prompt.
+Preserve owned-path writes and do not modify predecessor-owned paths.
+
 $TaskPrompt
 "@
 
@@ -1104,7 +1576,7 @@ $TaskPrompt
 
     $eventLines = @(
         $workerPrompt |
-            & codex @codexArguments 2>&1 |
+            & $CodexExecutable @codexArguments 2>&1 |
             ForEach-Object { $_.ToString() }
     )
     $exitCode = if ($null -eq $LASTEXITCODE) { 1 } else { [int]$LASTEXITCODE }
@@ -1142,6 +1614,204 @@ $terminalJobStates = @("Completed", "Failed", "Stopped", "Disconnected", "Blocke
 $runMutex = [System.Threading.Mutex]::new($false, $workerMutexName)
 $runMutexAcquired = $false
 
+function Get-V2DependencyStates {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName
+    )
+
+    $states = [ordered]@{}
+    foreach ($dependencyName in @($taskByName[$TaskName].depends_on)) {
+        $states[$dependencyName] = $workerRecordByName[$dependencyName].state
+    }
+    $states
+}
+
+function Get-V2ReadyOrder {
+    $readyNames = @(
+        $workerRecords |
+            Where-Object { $_.state -eq "ready" } |
+            ForEach-Object { $_.name }
+    )
+    @(Get-DeterministicReadyOrder -Names $readyNames)
+}
+
+function Set-V2TaskReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName,
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$ReadyAt
+    )
+
+    $record = $workerRecordByName[$TaskName]
+    if ($record.state -ne "pending") {
+        return
+    }
+    $record.state = "ready"
+    $record.ready_at = $ReadyAt.ToString("O", [System.Globalization.CultureInfo]::InvariantCulture)
+    $record.blocked_by = [string[]]@()
+    $record.dependency_states = Get-V2DependencyStates -TaskName $TaskName
+}
+
+function Mark-V2SkippedDescendants {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FailedTaskName,
+        [Parameter(Mandatory = $true)]
+        [string]$Reason,
+        [Parameter(Mandatory = $true)]
+        [DateTimeOffset]$SkippedAt
+    )
+
+    foreach ($dependentName in @($dependentsByName[$FailedTaskName] | Sort-Object)) {
+        $record = $workerRecordByName[$dependentName]
+        if ($record.state -in @("completed", "failed", "skipped", "running")) {
+            continue
+        }
+        $record.state = "skipped"
+        $record.completed_at = $SkippedAt.ToString("O", [System.Globalization.CultureInfo]::InvariantCulture)
+        $record.duration_seconds = $null
+        $record.queue_wait_seconds = $null
+        $record.exit_code = $null
+        $record.error = $null
+        $record.skip_reason = $Reason
+        $record.dependency_states = Get-V2DependencyStates -TaskName $dependentName
+        $record.blocked_by = [string[]]@(
+            @($record.depends_on) |
+                Where-Object {
+                    $workerRecordByName[$_].state -in @("failed", "skipped")
+                }
+        )
+        $resultsByName[$dependentName] = New-WorkerResult `
+            -Record $record `
+            -ExitCode $null `
+            -LastMessage "" `
+            -ErrorMessage ""
+        Mark-V2SkippedDescendants `
+            -FailedTaskName $dependentName `
+            -Reason "Skipped because dependency '$dependentName' was skipped." `
+            -SkippedAt $SkippedAt
+    }
+}
+
+function Get-WorkerJobOutcome {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Entry
+    )
+
+    $currentJob = Get-Job -Id ([int]$Entry.job.Id) -ErrorAction SilentlyContinue
+    if ($null -ne $currentJob) {
+        $Entry.job = $currentJob
+    }
+    $receiveError = $null
+    $received = @()
+    try {
+        $received = @($Entry.job | Receive-Job -ErrorAction Stop)
+    } catch {
+        $receiveError = $_.Exception.Message
+    }
+    $workerResult = $null
+    if ($null -eq $receiveError) {
+        foreach ($candidate in $received) {
+            if ($null -ne $candidate -and
+                $candidate.PSObject.Properties.Name -contains "exit_code") {
+                $workerResult = $candidate
+                break
+            }
+        }
+    }
+
+    $exitCode = 1
+    $lastMessage = ""
+    $failureMessage = $null
+    if ($Entry.job.State -ne "Completed") {
+        $failureMessage = "Thread job ended in state '$($Entry.job.State)'."
+        $reason = $Entry.job.JobStateInfo.Reason
+        if ($null -ne $reason -and -not [string]::IsNullOrWhiteSpace($reason.Message)) {
+            $failureMessage = "$failureMessage $($reason.Message)"
+        }
+    } elseif ($null -ne $receiveError) {
+        $failureMessage = "Unable to receive worker result: $receiveError"
+    } elseif ($null -eq $workerResult) {
+        $failureMessage = "Worker completed without a result object."
+    } else {
+        try {
+            $exitCode = [int]$workerResult.exit_code
+        } catch {
+            $failureMessage = "Worker returned an invalid exit code."
+        }
+        if ($workerResult.PSObject.Properties.Name -contains "last_message") {
+            $lastMessage = [string]$workerResult.last_message
+        }
+        if ($exitCode -ne 0 -and $null -eq $failureMessage) {
+            $failureMessage = "Worker exited with code $exitCode."
+        }
+    }
+    [pscustomobject]@{
+        exit_code = $exitCode
+        last_message = $lastMessage
+        error = $failureMessage
+        success = ($exitCode -eq 0 -and $null -eq $failureMessage)
+    }
+}
+
+function Start-V2Task {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName,
+        [Parameter(Mandatory = $true)]
+        [ref]$AllJobs,
+        [Parameter(Mandatory = $true)]
+        [ref]$PeakActiveWorkers
+    )
+
+    $task = $taskByName[$TaskName]
+    $record = $workerRecordByName[$TaskName]
+    $startedAt = [DateTimeOffset]::UtcNow
+    $record.started_at = $startedAt.ToString("O", [System.Globalization.CultureInfo]::InvariantCulture)
+    if ($null -ne $record.ready_at) {
+        $record.queue_wait_seconds = Get-DurationSeconds `
+            -Start ([DateTimeOffset]$record.ready_at) `
+            -End $startedAt
+    } else {
+        $record.queue_wait_seconds = 0.0
+    }
+    $record.blocked_by = [string[]]@()
+    $record.dependency_states = Get-V2DependencyStates -TaskName $TaskName
+    $assignmentContract = [ordered]@{
+        working_directory = $task.working_directory
+        review_only = $task.review_only
+        owned_paths = [string[]]$task.owned_paths
+        depends_on = [string[]]$task.depends_on
+        predecessor_task_names = [string[]]$task.depends_on
+        dependency_handoff = "Read only frozen artifacts/contracts from the predecessor task names; no raw predecessor output injection."
+        estimated_seconds = $task.estimated_seconds
+        contract_ids = [string[]]$task.contract_ids
+        acceptance = [string[]]$task.acceptance
+        verification = [string[]]$task.verification
+    } | ConvertTo-Json -Depth 8
+    $job = Start-ThreadJob -ScriptBlock $workerScript -ArgumentList @(
+        $task.name,
+        $task.prompt,
+        $task.working_directory,
+        $OutputDirectory,
+        [string]$assignmentContract,
+        $CodexExecutable
+    )
+    $record.state = "running"
+    $jobEntriesById[[int]$job.Id] = [pscustomobject]@{
+        job = $job
+        record = $record
+        started_at = $startedAt
+    }
+    $AllJobs.Value += $job
+    if ($jobEntriesById.Count -gt $PeakActiveWorkers.Value) {
+        $PeakActiveWorkers.Value = $jobEntriesById.Count
+    }
+}
+
 try {
     try {
         $runMutexAcquired = $runMutex.WaitOne(0)
@@ -1156,6 +1826,7 @@ try {
     }
 
     Write-RunStatus -RunState "starting"
+    if (-not $isSchemaV2) {
     foreach ($task in $validatedTasks) {
         $record = $workerRecordByName[$task.name]
         $startedAt = [DateTimeOffset]::UtcNow
@@ -1166,6 +1837,8 @@ try {
                 review_only = $task.review_only
                 owned_paths = [string[]]$task.owned_paths
                 depends_on = [string[]]$task.depends_on
+                predecessor_task_names = [string[]]$task.depends_on
+                dependency_handoff = "Read only frozen artifacts/contracts from the predecessor task names; no raw predecessor output injection."
                 estimated_seconds = $task.estimated_seconds
                 contract_ids = [string[]]$task.contract_ids
                 acceptance = [string[]]$task.acceptance
@@ -1176,7 +1849,8 @@ try {
                 $task.prompt,
                 $task.working_directory,
                 $OutputDirectory,
-                [string]$assignmentContract
+                [string]$assignmentContract,
+                $CodexExecutable
             )
             $record.state = "running"
             $jobEntriesById[[int]$job.Id] = [pscustomobject]@{
@@ -1293,10 +1967,186 @@ try {
             Write-RunStatus -RunState $statusAfterCompletion
         }
     }
+    } else {
+        $v2BarrierBatchIds = [System.Collections.Generic.HashSet[int]]::new()
+        $v2CompletedCount = 0
+        $v2BatchOpen = $false
+        Write-RunStatus -RunState "running"
+
+        while ($true) {
+            $v2NonTerminal = @(
+                $workerRecords |
+                    Where-Object { $_.state -in @("pending", "ready", "running") }
+            )
+            if ($v2NonTerminal.Count -eq 0) {
+                break
+            }
+
+            if ($schedulerMode -eq "rolling-dag-v1") {
+                while ($jobEntriesById.Count -lt $concurrencyLimit) {
+                    $readyOrder = @(Get-V2ReadyOrder)
+                    if ($readyOrder.Count -eq 0) {
+                        break
+                    }
+                    $nextTaskName = $readyOrder[0]
+                    try {
+                        Start-V2Task `
+                            -TaskName $nextTaskName `
+                            -AllJobs ([ref]$allJobs) `
+                            -PeakActiveWorkers ([ref]$peakActiveWorkers)
+                    } catch {
+                        $record = $workerRecordByName[$nextTaskName]
+                        $failedAt = [DateTimeOffset]::UtcNow
+                        $record.state = "failed"
+                        $record.completed_at = $failedAt.ToString("O", [System.Globalization.CultureInfo]::InvariantCulture)
+                        $record.duration_seconds = if ($null -ne $record.started_at) {
+                            Get-DurationSeconds -Start ([DateTimeOffset]$record.started_at) -End $failedAt
+                        } else {
+                            0.0
+                        }
+                        $record.exit_code = 1
+                        $record.error = $_.Exception.Message
+                        $record.dependency_states = Get-V2DependencyStates -TaskName $nextTaskName
+                        $resultsByName[$nextTaskName] = New-WorkerResult `
+                            -Record $record `
+                            -ExitCode 1 `
+                            -LastMessage "" `
+                            -ErrorMessage $record.error
+                        Mark-V2SkippedDescendants `
+                            -FailedTaskName $nextTaskName `
+                            -Reason "Skipped because dependency '$nextTaskName' failed to start." `
+                            -SkippedAt $failedAt
+                    }
+                    Write-RunStatus -RunState "running"
+                }
+            } elseif (-not $v2BatchOpen -and $jobEntriesById.Count -eq 0) {
+                $batchOrder = @(Get-V2ReadyOrder | Select-Object -First $concurrencyLimit)
+                if ($batchOrder.Count -eq 0) {
+                    throw "The v2 DAG scheduler has pending work but no ready task."
+                }
+                $v2BatchOpen = $true
+                foreach ($batchTaskName in $batchOrder) {
+                    try {
+                        Start-V2Task `
+                            -TaskName $batchTaskName `
+                            -AllJobs ([ref]$allJobs) `
+                            -PeakActiveWorkers ([ref]$peakActiveWorkers)
+                        $startedJobIds = @(
+                            $jobEntriesById.Keys |
+                                Where-Object { $jobEntriesById[$_].record.name -eq $batchTaskName }
+                        )
+                        if ($startedJobIds.Count -gt 0) {
+                            [void]$v2BarrierBatchIds.Add([int]$startedJobIds[-1])
+                        }
+                    } catch {
+                        $record = $workerRecordByName[$batchTaskName]
+                        $failedAt = [DateTimeOffset]::UtcNow
+                        $record.state = "failed"
+                        $record.completed_at = $failedAt.ToString("O", [System.Globalization.CultureInfo]::InvariantCulture)
+                        $record.duration_seconds = if ($null -ne $record.started_at) {
+                            Get-DurationSeconds -Start ([DateTimeOffset]$record.started_at) -End $failedAt
+                        } else {
+                            0.0
+                        }
+                        $record.exit_code = 1
+                        $record.error = $_.Exception.Message
+                        $record.dependency_states = Get-V2DependencyStates -TaskName $batchTaskName
+                        $resultsByName[$batchTaskName] = New-WorkerResult `
+                            -Record $record `
+                            -ExitCode 1 `
+                            -LastMessage "" `
+                            -ErrorMessage $record.error
+                        Mark-V2SkippedDescendants `
+                            -FailedTaskName $batchTaskName `
+                            -Reason "Skipped because dependency '$batchTaskName' failed to start." `
+                            -SkippedAt $failedAt
+                    }
+                    Write-RunStatus -RunState "running"
+                }
+                if ($v2BarrierBatchIds.Count -eq 0) {
+                    $v2BatchOpen = $false
+                }
+            }
+
+            $completedEntries = @()
+            foreach ($entry in @($jobEntriesById.Values)) {
+                $currentJob = Get-Job -Id ([int]$entry.job.Id) -ErrorAction SilentlyContinue
+                if ($null -ne $currentJob) {
+                    $entry.job = $currentJob
+                }
+                if ($entry.job.State -in $terminalJobStates) {
+                    if ($schedulerMode -eq "rolling-dag-v1" -or
+                        $v2BarrierBatchIds.Contains([int]$entry.job.Id)) {
+                        $completedEntries += $entry
+                    }
+                }
+            }
+            $completedEntries = @(
+                $completedEntries |
+                    Sort-Object -Property @{ Expression = { [string]$_.record.name } }
+            )
+
+            if ($completedEntries.Count -eq 0) {
+                Write-RunStatus -RunState "running"
+                Start-Sleep -Milliseconds 100
+                continue
+            }
+
+            foreach ($entry in $completedEntries) {
+                $record = $entry.record
+                $completedAt = [DateTimeOffset]::UtcNow
+                $record.completed_at = $completedAt.ToString("O", [System.Globalization.CultureInfo]::InvariantCulture)
+                $record.duration_seconds = Get-DurationSeconds -Start $entry.started_at -End $completedAt
+                $outcome = Get-WorkerJobOutcome -Entry $entry
+                $record.exit_code = $outcome.exit_code
+                $record.error = $outcome.error
+                $record.state = if ($outcome.success) { "completed" } else { "failed" }
+                $record.dependency_states = Get-V2DependencyStates -TaskName $record.name
+                $resultsByName[$record.name] = New-WorkerResult `
+                    -Record $record `
+                    -ExitCode $outcome.exit_code `
+                    -LastMessage $outcome.last_message `
+                    -ErrorMessage ([string]$outcome.error)
+                [void]$jobEntriesById.Remove([int]$entry.job.Id)
+                if ($v2BarrierBatchIds.Contains([int]$entry.job.Id)) {
+                    [void]$v2BarrierBatchIds.Remove([int]$entry.job.Id)
+                }
+                if ($outcome.success) {
+                    $v2CompletedCount++
+                    foreach ($dependentName in @($dependentsByName[$record.name])) {
+                        $dependentRecord = $workerRecordByName[$dependentName]
+                        $dependentRecord.dependency_states = Get-V2DependencyStates -TaskName $dependentName
+                        $dependentRecord.blocked_by = [string[]]@(
+                            @($dependentRecord.depends_on) |
+                                Where-Object {
+                                    $workerRecordByName[$_].state -notin @("completed")
+                                }
+                        )
+                        if ($dependentRecord.state -eq "pending" -and
+                            @($dependentRecord.depends_on | Where-Object {
+                                $workerRecordByName[$_].state -ne "completed"
+                            }).Count -eq 0) {
+                            Set-V2TaskReady -TaskName $dependentName -ReadyAt $completedAt
+                        }
+                    }
+                } else {
+                    Mark-V2SkippedDescendants `
+                        -FailedTaskName $record.name `
+                        -Reason "Skipped because dependency '$($record.name)' failed." `
+                        -SkippedAt $completedAt
+                }
+                Write-RunStatus -RunState "running"
+            }
+
+            if ($schedulerMode -eq "barrier-dag-v1" -and $v2BarrierBatchIds.Count -eq 0) {
+                $v2BatchOpen = $false
+            }
+        }
+    }
 } finally {
     foreach ($job in @($allJobs)) {
         if ($null -ne $job) {
-            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue | Out-Null
+            Remove-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
         }
     }
     if ($runMutexAcquired) {
@@ -1331,6 +2181,12 @@ foreach ($task in $validatedTasks) {
     }
 }
 
+if ($isSchemaV2) {
+    foreach ($resultName in $resultsByName.Keys) {
+        $resultsByName[$resultName].initial_ready_count = $initialReadyCount
+        $resultsByName[$resultName].peak_active_workers = $peakActiveWorkers
+    }
+}
 $results = @($validatedTasks | ForEach-Object { $resultsByName[$_.name] })
 $resultsJson = $results | ConvertTo-Json -Depth 5
 Write-AtomicText -Path $runResultsPath -Content ([string]$resultsJson)
@@ -1353,9 +2209,10 @@ $parallelismRatio = if ($wallDurationSeconds -gt 0) {
 } else {
     0.0
 }
-$actualCapacityUtilization = if ($wallDurationSeconds -gt 0 -and $workerRecords.Count -gt 0) {
+$capacityDenominator = if ($isSchemaV2) { $concurrencyLimit } else { $workerRecords.Count }
+$actualCapacityUtilization = if ($wallDurationSeconds -gt 0 -and $capacityDenominator -gt 0) {
     [Math]::Round(
-        $summedWorkerDurationSeconds / ($workerRecords.Count * $wallDurationSeconds),
+        $summedWorkerDurationSeconds / ($capacityDenominator * $wallDurationSeconds),
         3
     )
 } else {
@@ -1379,10 +2236,25 @@ $actualBalanceRatio = if ($actualMaximumDuration -gt 0) {
 $idleSlotSeconds = [Math]::Round(
     [Math]::Max(
         0.0,
-        ($workerRecords.Count * $wallDurationSeconds) - $summedWorkerDurationSeconds
+        ($capacityDenominator * $wallDurationSeconds) - $summedWorkerDurationSeconds
     ),
     3
 )
+$queueWaitValues = @(
+    $workerRecords |
+        Where-Object { $null -ne $_.queue_wait_seconds } |
+        ForEach-Object { [double]$_.queue_wait_seconds }
+)
+$totalQueueWaitSeconds = if ($queueWaitValues.Count -gt 0) {
+    [Math]::Round(([double]($queueWaitValues | Measure-Object -Sum).Sum), 3)
+} else {
+    0.0
+}
+$maximumQueueWaitSeconds = if ($queueWaitValues.Count -gt 0) {
+    [Math]::Round(([double]($queueWaitValues | Measure-Object -Maximum).Maximum), 3)
+} else {
+    0.0
+}
 $workerStartTimes = @(
     $workerRecords |
         Where-Object { $null -ne $_.started_at } |
@@ -1406,7 +2278,12 @@ $workerFailures = @(
             ($null -ne $_.exit_code -and [int]$_.exit_code -ne 0)
         }
 )
-$finalStatus = if ($workerFailures.Count -gt 0) { "failed" } else { "completed" }
+$workerSkips = @($workerRecords | Where-Object { $_.state -eq "skipped" })
+$finalStatus = if ($workerFailures.Count -gt 0 -or $workerSkips.Count -gt 0) {
+    "failed"
+} else {
+    "completed"
+}
 $slowestRecord = $workerRecords |
     Where-Object { $null -ne $_.duration_seconds } |
     Sort-Object -Property @{ Expression = { [double]$_.duration_seconds }; Descending = $true } |
@@ -1421,7 +2298,7 @@ $slowestWorker = if ($null -eq $slowestRecord) {
 }
 $summaryWorkers = @(
     $workerRecords | ForEach-Object {
-        [ordered]@{
+        $summaryWorker = [ordered]@{
             name = $_.name
             working_directory = $_.working_directory
             review_only = $_.review_only
@@ -1443,6 +2320,18 @@ $summaryWorkers = @(
             completed_at = $_.completed_at
             duration_seconds = $_.duration_seconds
         }
+        if ($isSchemaV2) {
+            $summaryWorker["scheduler_mode"] = $_.scheduler_mode
+            $summaryWorker["concurrency_limit"] = $_.concurrency_limit
+            $summaryWorker["task_count"] = $_.task_count
+            $summaryWorker["ready_at"] = $_.ready_at
+            $summaryWorker["queue_wait_seconds"] = $_.queue_wait_seconds
+            $summaryWorker["critical_path_seconds"] = $_.critical_path_seconds
+            $summaryWorker["blocked_by"] = [string[]]$_.blocked_by
+            $summaryWorker["dependency_states"] = $_.dependency_states
+            $summaryWorker["skip_reason"] = $_.skip_reason
+        }
+        $summaryWorker
     }
 )
 $runSummary = [ordered]@{
@@ -1482,7 +2371,58 @@ $runSummary = [ordered]@{
         summary_path = $runSummaryPath
     }
 }
+if ($isSchemaV2) {
+    $runSummary["scheduler_mode"] = $schedulerMode
+    $runSummary["concurrency_limit"] = $concurrencyLimit
+    $runSummary["task_count"] = $taskCount
+    $runSummary["initial_ready_count"] = $initialReadyCount
+    $runSummary["critical_path"] = [string[]]$criticalPathTaskNames
+    $runSummary["critical_path_seconds"] = $criticalPathSeconds
+    $runSummary["peak_active_workers"] = $peakActiveWorkers
+    $runSummary["utilization_capacity_denominator"] = $concurrencyLimit
+    $runSummary["total_queue_wait_seconds"] = $totalQueueWaitSeconds
+    $runSummary["maximum_queue_wait_seconds"] = $maximumQueueWaitSeconds
+    $stateCounts = [ordered]@{
+        pending = @($workerRecords | Where-Object { $_.state -eq "pending" }).Count
+        ready = @($workerRecords | Where-Object { $_.state -eq "ready" }).Count
+        running = @($workerRecords | Where-Object { $_.state -eq "running" }).Count
+        completed = @($workerRecords | Where-Object { $_.state -eq "completed" }).Count
+        failed = @($workerRecords | Where-Object { $_.state -eq "failed" }).Count
+        skipped = @($workerRecords | Where-Object { $_.state -eq "skipped" }).Count
+    }
+    $runSummary["state_counts"] = $stateCounts
+    $runSummary["completed_count"] = $stateCounts.completed
+    $runSummary["failed_count"] = $stateCounts.failed
+    $runSummary["skipped_count"] = $stateCounts.skipped
+}
 Write-AtomicJson -Path $runSummaryPath -Value $runSummary -Depth 10
+if ($isSchemaV2) {
+    foreach ($normalizedTask in $normalizedTasks) {
+        $record = $workerRecordByName[$normalizedTask.name]
+        $normalizedTask["state"] = $record.state
+        $normalizedTask["ready_at"] = $record.ready_at
+        $normalizedTask["started_at"] = $record.started_at
+        $normalizedTask["completed_at"] = $record.completed_at
+        $normalizedTask["queue_wait_seconds"] = $record.queue_wait_seconds
+        $normalizedTask["blocked_by"] = [string[]]$record.blocked_by
+        $normalizedTask["dependency_states"] = $record.dependency_states
+        $normalizedTask["skip_reason"] = $record.skip_reason
+    }
+    $finalManifestDocument = [ordered]@{
+        schema_version = 2
+        scheduler_mode = $schedulerMode
+        concurrency_limit = $concurrencyLimit
+        task_count = $taskCount
+        initial_ready_count = $initialReadyCount
+        critical_path = [string[]]$criticalPathTaskNames
+        critical_path_seconds = $criticalPathSeconds
+        peak_active_workers = $peakActiveWorkers
+        plan = $normalizedPlan
+        plan_warnings = [string[]]$planWarnings
+        workers = [object[]]$normalizedTasks
+    }
+    Write-AtomicJson -Path $runManifestPath -Value $finalManifestDocument -Depth 15
+}
 Write-RunStatus -RunState $finalStatus
 
 # Preserve the original synchronous stdout contract: the result is still the
