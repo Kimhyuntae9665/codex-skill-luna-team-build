@@ -9,7 +9,7 @@
 - Sol freezes contracts, ownership, task IDs, dependencies, handoffs, and checks in the Plan Card. `k` is the total selected Luna task/session count from zero through seven. At zero, Sol completes and verifies directly; no Luna worker runs.
 - For positive `k`, isolated GPT-5.6 Luna `codex exec` sessions share the filesystem and provide terminal handoffs. Sol integrates successful results and owns combined verification. Failure skips the failed predecessor's descendants while unrelated branches continue.
 - Schema v1 is the default independent ready wave. Schema v2 admits a frozen static DAG; its `concurrency_limit` is the simultaneous-active cap, separate from total task count. Rolling scheduling unlocks successors on success. Barrier mode is reserved for an A/B benchmark or documented compatibility investigation.
-- The dashed `$council` branch is separate, full external planning advice and applies only when explicitly invoked. It is not an automatically launched set of five workers. The diagram is an overview of the default and explicit optional paths; separately documented high-risk gates remain governed by the source contract.
+- The dashed `$council` branch is separate, full external planning advice and applies when explicitly invoked or required by a separately documented high-risk gate. It is not an automatically launched set of five workers. The diagram is an overview of the default and optional paths; high-risk gates remain governed by the source contract.
 
 ## Artwork and export
 

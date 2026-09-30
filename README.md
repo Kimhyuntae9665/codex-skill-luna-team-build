@@ -4,7 +4,7 @@
 
 [Editable SVG](assets/architecture.svg) · [Artwork and contract provenance](assets/architecture-provenance.md)
 
-Sol's five Council views are **in-thread planning lenses**. Sol freezes the Plan Card, selects **k = 0..7 total Luna task sessions**, and verifies the combined result. With k=0, Sol completes the work directly. For schema v2, the simultaneous-active `concurrency_limit` is separate from k. A failed predecessor skips its descendants; unrelated branches continue. The dashed full `$council` branch is optional and requires an explicit invocation. Sun and moon symbols are original conceptual artwork.
+Sol's five Council views are **in-thread planning lenses**. Sol freezes the Plan Card, selects **k = 0..7 total Luna task sessions**, and verifies the combined result. With k=0, Sol completes the work directly. For schema v2, the simultaneous-active `concurrency_limit` is separate from k. A failed predecessor skips its descendants; unrelated branches continue. The dashed full `$council` branch is optional and requires an explicit invocation or a separately documented high-risk gate. Sun and moon symbols are original conceptual artwork.
 
 GPT-5.6 Sol을 루트 지휘자로 두고, 필요할 때만 GPT-5.6 Luna 작업자를 병렬로 실행하는 Codex Skill입니다. 복잡한 코딩·리팩터링·데이터·UI·검증 작업을 작은 단위로 나누고, 계약을 고정한 뒤 결과를 다시 루트에서 통합하고 검증합니다.
 

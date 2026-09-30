@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="720" height="510" viewBox="0 0 720 510" role="img" aria-labelledby="title desc">
   <title id="title">Luna Team Build architecture</title>
-  <desc id="desc">GPT-5.6 Sol applies five in-thread planning lenses and freezes a Plan Card. With k from one to seven, isolated GPT-5.6 Luna task sessions produce handoffs for Sol verification. With k zero, the Plan Card routes directly to Sol verification. A separate full Council is an explicitly invoked optional planning branch. The v2 concurrency cap is separate from total task count.</desc>
+  <desc id="desc">GPT-5.6 Sol applies five in-thread planning lenses and freezes a Plan Card. With k from one to seven, isolated GPT-5.6 Luna task sessions produce handoffs for Sol verification. With k zero, the Plan Card routes directly to Sol verification. A separate full Council is an optional planning branch, permitted by explicit invocation or a separately documented high-risk gate. The v2 concurrency cap is separate from total task count.</desc>
   <defs>
     <pattern id="dots" width="20" height="20" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#364254"/></pattern>
     <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0L8 4L0 8Z" fill="#aeb9ca"/></marker>
@@ -19,8 +19,7 @@
   </g>
   <g aria-label="Sol with five planning lenses">
     <rect class="card" x="70" y="56" width="120" height="120" rx="22"/>
-    <use href="#sun" transform="translate(130 99)"/>
-    <text class="small" x="130" y="154">5 lenses</text>
+    <use href="#sun" transform="translate(130 116)"/>
     <text class="name" x="130" y="214">GPT-5.6 Sol</text>
   </g>
   <g aria-label="Frozen Plan Card">
@@ -33,16 +32,14 @@
   </g>
   <g aria-label="One to seven selected Luna tasks">
     <rect class="card" x="530" y="56" width="120" height="120" rx="22"/>
-    <use href="#moon" transform="translate(585 99)"/>
-    <text class="small" x="590" y="154">k = 1&#x2026;7</text>
+    <use href="#moon" transform="translate(585 116)"/>
     <text class="name" x="590" y="214">GPT-5.6 Luna</text>
   </g>
   <text x="270" y="254" style="font-size:24px;fill:#d5dce7">k = 0</text>
-  <g aria-label="Explicit optional full Council">
+  <g aria-label="Optional full Council via explicit invocation or documented high-risk gate">
     <rect class="card" x="70" y="304" width="120" height="120" rx="22"/>
-    <use href="#moon" transform="translate(106 336) scale(.4)"/><use href="#moon" transform="translate(133 336) scale(.4)"/><use href="#moon" transform="translate(160 336) scale(.4)"/>
-    <use href="#moon" transform="translate(119 364) scale(.4)"/><use href="#moon" transform="translate(147 364) scale(.4)"/>
-    <text class="small" x="130" y="401">optional</text>
+    <use href="#moon" transform="translate(106 352) scale(.4)"/><use href="#moon" transform="translate(133 352) scale(.4)"/><use href="#moon" transform="translate(160 352) scale(.4)"/>
+    <use href="#moon" transform="translate(119 380) scale(.4)"/><use href="#moon" transform="translate(147 380) scale(.4)"/>
     <text class="name" x="130" y="463">$council</text>
   </g>
   <g aria-label="Root integration and combined verification">
