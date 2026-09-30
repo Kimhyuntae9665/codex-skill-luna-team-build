@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="510" viewBox="0 0 720 510" role="img" aria-labelledby="title desc">
+  <title id="title">Luna Team Build architecture</title>
+  <desc id="desc">GPT-5.6 Sol applies five in-thread planning lenses and freezes a Plan Card. With k from one to seven, isolated GPT-5.6 Luna task sessions produce handoffs for Sol verification. With k zero, the Plan Card routes directly to Sol verification. A separate full Council is an explicitly invoked optional planning branch. The v2 concurrency cap is separate from total task count.</desc>
+  <defs>
+    <pattern id="dots" width="20" height="20" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#364254"/></pattern>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0L8 4L0 8Z" fill="#aeb9ca"/></marker>
+    <g id="sun" fill="none" stroke="#edaa35" stroke-width="5" stroke-linecap="round"><circle r="17" fill="#ffd578"/><path d="M0-31V-26M0 26V31M-31 0H-26M26 0H31M-22-22L-18-18M18 18L22 22M22-22L18-18M-18 18L-22 22"/></g>
+    <g id="moon"><path d="M15-26A29 29 0 1 0 25 20A26 26 0 0 1 15-26Z" fill="#7265e8"/><circle cx="20" cy="-12" r="3" fill="#8c85f6"/></g>
+    <style>text{font-family:Arial,Helvetica,sans-serif;text-anchor:middle} .name{font-size:28px;fill:#d5dce7} .small{font-size:22px;fill:#354154} .edge{fill:none;stroke:#aeb9ca;stroke-width:2.5;marker-end:url(#arrow)} .optional{stroke-dasharray:6 6} .card{fill:#fff;stroke:#a8b6ce;stroke-width:1.8}</style>
+  </defs>
+  <rect width="720" height="510" fill="#191f2b"/><rect width="720" height="510" fill="url(#dots)"/>
+  <g aria-label="Directed workflow connectors">
+    <path class="edge" d="M190 116C223 100 267 100 299 116"/>
+    <path class="edge" d="M420 116C453 100 497 100 529 116"/>
+    <path class="edge" d="M590 176C590 215 613 257 613 277C613 291 590 285 590 303"/>
+    <path class="edge" d="M530 364C497 380 453 380 421 364"/>
+    <path class="edge optional" d="M300 151C230 151 233 237 233 268C233 302 270 336 299 336"/>
+    <path class="edge optional" d="M70 364C27 364 27 291 27 246C27 200 27 116 69 116"/>
+  </g>
+  <g aria-label="Sol with five planning lenses">
+    <rect class="card" x="70" y="56" width="120" height="120" rx="22"/>
+    <use href="#sun" transform="translate(130 99)"/>
+    <text class="small" x="130" y="154">5 lenses</text>
+    <text class="name" x="130" y="214">GPT-5.6 Sol</text>
+  </g>
+  <g aria-label="Frozen Plan Card">
+    <rect class="card" x="300" y="56" width="120" height="120" rx="22"/>
+    <path d="M337 81H374L385 92V148H337Z" fill="#edf2f8" stroke="#526a88" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M374 81V94H385M348 105H374M348 115H364" fill="none" stroke="#526a88" stroke-width="3" stroke-linecap="round"/>
+    <path d="M349 137L361 125L374 137" fill="none" stroke="#648cba" stroke-width="2.5"/>
+    <circle cx="349" cy="137" r="4" fill="#648cba"/><circle cx="361" cy="125" r="4" fill="#648cba"/><circle cx="374" cy="137" r="4" fill="#648cba"/>
+    <text class="name" x="360" y="214">Plan Card</text>
+  </g>
+  <g aria-label="One to seven selected Luna tasks">
+    <rect class="card" x="530" y="56" width="120" height="120" rx="22"/>
+    <use href="#moon" transform="translate(585 99)"/>
+    <text class="small" x="590" y="154">k = 1&#x2026;7</text>
+    <text class="name" x="590" y="214">GPT-5.6 Luna</text>
+  </g>
+  <text x="270" y="254" style="font-size:24px;fill:#d5dce7">k = 0</text>
+  <g aria-label="Explicit optional full Council">
+    <rect class="card" x="70" y="304" width="120" height="120" rx="22"/>
+    <use href="#moon" transform="translate(106 336) scale(.4)"/><use href="#moon" transform="translate(133 336) scale(.4)"/><use href="#moon" transform="translate(160 336) scale(.4)"/>
+    <use href="#moon" transform="translate(119 364) scale(.4)"/><use href="#moon" transform="translate(147 364) scale(.4)"/>
+    <text class="small" x="130" y="401">optional</text>
+    <text class="name" x="130" y="463">$council</text>
+  </g>
+  <g aria-label="Root integration and combined verification">
+    <rect class="card" x="300" y="304" width="120" height="120" rx="22"/>
+    <use href="#sun" transform="translate(349 352) scale(.75)"/>
+    <circle cx="373" cy="375" r="19" fill="#388366" stroke="#fff" stroke-width="3"/>
+    <path d="M363 375L370 382L384 367" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text class="name" x="360" y="463">Sol verification</text>
+  </g>
+  <g aria-label="Terminal task handoff artifacts">
+    <rect class="card" x="530" y="304" width="120" height="120" rx="22"/>
+    <path d="M556 344H582L590 353H624V390H556Z" fill="#dce8f4" stroke="#526a88" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M570 332H608V373H570Z" fill="#fff" stroke="#526a88" stroke-width="3"/>
+    <path d="M579 343H599M579 353H599M579 363H594" stroke="#648cba" stroke-width="3" stroke-linecap="round"/>
+    <path d="M556 361H624V390H556Z" fill="#dce8f4" stroke="#526a88" stroke-width="3" stroke-linejoin="round"/>
+    <text class="name" x="590" y="463">Handoffs</text>
+  </g>
+</svg>

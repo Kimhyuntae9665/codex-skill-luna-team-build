@@ -1,5 +1,11 @@
 # luna-team-build
 
+![Luna Team Build architecture: Sol planning, optional Luna tasks, handoffs, and root verification](assets/architecture.png)
+
+[Editable SVG](assets/architecture.svg) · [Artwork and contract provenance](assets/architecture-provenance.md)
+
+Sol's five Council views are **in-thread planning lenses**. Sol freezes the Plan Card, selects **k = 0..7 total Luna task sessions**, and verifies the combined result. With k=0, Sol completes the work directly. For schema v2, the simultaneous-active `concurrency_limit` is separate from k. A failed predecessor skips its descendants; unrelated branches continue. The dashed full `$council` branch is optional and requires an explicit invocation. Sun and moon symbols are original conceptual artwork.
+
 GPT-5.6 Sol을 루트 지휘자로 두고, 필요할 때만 GPT-5.6 Luna 작업자를 병렬로 실행하는 Codex Skill입니다. 복잡한 코딩·리팩터링·데이터·UI·검증 작업을 작은 단위로 나누고, 계약을 고정한 뒤 결과를 다시 루트에서 통합하고 검증합니다.
 
 이 프로젝트는 OpenAI의 공식 제품, 보증, 추천 또는 후원 프로젝트가 아닙니다. 모델 이름과 기능 제공 여부는 계정·지역·제품 버전에 따라 달라질 수 있습니다.
@@ -291,6 +297,9 @@ danger-full-access와 approval_policy=never 조합은 작업자 프로세스가 
 │       └── references/
 │           └── planning-council.md
 ├── assets/
+│   ├── architecture.svg
+│   ├── architecture.png
+│   ├── architecture-provenance.md
 │   └── efficiency-benchmark.svg
 ├── docs/
 │   ├── benchmark-data.csv
@@ -318,6 +327,7 @@ danger-full-access와 approval_policy=never 조합은 작업자 프로세스가 
 문서 산출물만 빠르게 확인하려면 저장소 루트에서 다음을 실행할 수 있습니다.
 
 ~~~powershell
+[xml](Get-Content -Raw .\assets\architecture.svg) | Out-Null
 [xml](Get-Content -Raw .\assets\efficiency-benchmark.svg) | Out-Null
 Import-Csv .\docs\benchmark-data.csv | Format-Table
 ~~~
